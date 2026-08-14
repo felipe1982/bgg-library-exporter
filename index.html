@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BoardGameGeek Collection Downloader</title>
+  <!-- Tailwind CSS & Alpine.js via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen py-10 px-4 sm:px-6 lg:px-8">
+  <div class="max-w-6xl mx-auto" x-data="bggApp()">
+    
+    <!-- Header -->
+    <header class="text-center mb-8">
+      <h1 class="text-3xl sm:text-4xl font-bold tracking-tight text-white">BGG Collection Manager</h1>
+      <p class="mt-2 text-sm text-slate-400">Serverless & client-side reader for owned BoardGameGeek libraries</p>
+    </header>
+
+    <!-- Search Box -->
+    <div class="bg-slate-800 border border-slate-700 rounded-xl p-6 mb-8 shadow-lg">
+      <form @submit.prevent="fetchCollection" class="flex flex-col sm:flex-row gap-4">
+        <div class="flex-grow">
+          <label for="username" class="sr-only">BGG Username</label>
+          <input 
+            type="text" 
+            id="username" 
+            x-model="username" 
+            placeholder="Enter your BoardGameGeek username..." 
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            required
+          >
+        </div>
+        <button 
+          type="submit" 
+          :disabled="loading" 
+          class="bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 text-white font-semibold px-6 py-3 rounded-lg transition-colors flex items-center justify-center gap-2 min-w-[170px]"
+        >
+          <span x-show="!loading">Fetch Library</span>
+          <span x-show="loading" class="flex items-center gap-2">
+            <svg class="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24" fill="none">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+            </svg>
+            <span x-text="statusMessage || 'Loading...'"></span>
+          </span>
+        </button>
+      </form>
+
+      <!-- Status / Error Feedback -->
+      <div x-show="errorMessage" class="mt-4 p-4 bg-red-900/50 border border-red-700 rounded-lg text-red-200 text-sm" x-text="errorMessage"></div>
+    </div>
+
+    <!-- Active Games Table -->
+    <div x-show="games.length > 0" class="space-y-6">
+      
+      <!-- Filter Bar & Export Actions -->
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-800/60 p-4 rounded-xl border border-slate-700">
+        <div class="flex flex-wrap items-center gap-3">
+          <input 
+            type="text" 
+            x-model="searchQuery" 
+            placeholder="Search by title..." 
+            class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          >
+          <select 
+            x-model="playerFilter" 
+            class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          >
+            <option value="">Any Players</option>
+            <option value="1">1 Player (Solo)</option>
+            <option value="2">2 Players</option>
+            <option value="3">3 Players</option>
+            <option value="4">4 Players</option>
+            <option value="5">5+ Players</option>
+          </select>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-slate-400" x-text="`${filteredGames.length} of ${games.length} games shown`"></span>
+          <button 
+            @click="exportCSV" 
+            class="bg-slate-700 hover:bg-slate-600 text-xs text-slate-100 font-semibold px-3 py-2 rounded-md transition-colors"
+          >
+            Download CSV
+          </button>
+          <button 
+            @click="exportJSON" 
+            class="bg-slate-700 hover:bg-slate-600 text-xs text-slate-100 font-semibold px-3 py-2 rounded-md transition-colors"
+          >
+            Download JSON
+          </button>
+        </div>
+      </div>
+
+      <!-- Games Grid -->
+      <div class="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden shadow-lg">
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm text-slate-300">
+            <thead class="bg-slate-950 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-700">
+              <tr>
+                <th class="py-3 px-4">Game</th>
+                <th class="py-3 px-4">Year</th>
+                <th class="py-3 px-4">Players</th>
+                <th class="py-3 px-4">Playtime</th>
+                <th class="py-3 px-4">Avg Rating</th>
+                <th class="py-3 px-4">Rank</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-700/60">
+              <template x-for="game in filteredGames" :key="game.id">
+                <tr class="hover:bg-slate-700/30 transition-colors">
+                  <td class="py-3 px-4 flex items-center gap-3">
+                    <img 
+                      :src="game.thumbnail || 'data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'48\' height=\'48\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%2364748b\' stroke-width=\'2\'><rect width=\'18\' height=\'18\' x=\'3\' y=\'3\' rx=\'2\'/></svg>'" 
+                      :alt="game.name" 
+                      class="w-12 h-12 rounded object-cover bg-slate-950 flex-shrink-0"
+                    >
+                    <div>
+                      <a :href="`https://boardgamegeek.com/boardgame/${game.id}`" target="_blank" rel="noopener noreferrer" class="font-medium text-white hover:text-indigo-400 transition-colors" x-text="game.name"></a>
+                      <span class="block text-xs text-slate-500" x-text="`ID: ${game.id}`"></span>
+                    </div>
+                  </td>
+                  <td class="py-3 px-4 text-slate-400" x-text="game.year || '-'"></td>
+                  <td class="py-3 px-4" x-text="`${game.min_players} - ${game.max_players}`"></td>
+                  <td class="py-3 px-4" x-text="`${game.playtime} mins`"></td>
+                  <td class="py-3 px-4">
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-indigo-900/60 text-indigo-300 border border-indigo-700/40" x-text="game.avg_rating.toFixed(2)"></span>
+                  </td>
+                  <td class="py-3 px-4 text-slate-400" x-text="game.bgg_rank"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    function bggApp() {
+      return {
+        username: '',
+        loading: false,
+        statusMessage: '',
+        errorMessage: '',
+        games: [],
+        searchQuery: '',
+        playerFilter: '',
+
+        async fetchCollection() {
+          const user = this.username.trim();
+          if (!user) return;
+
+          this.loading = true;
+          this.statusMessage = 'Requesting...';
+          this.errorMessage = '';
+          this.games = [];
+
+          const bggUrl = `https://boardgamegeek.com/xmlapi2/collection?username=${encodeURIComponent(user)}&own=1&stats=1`;
+          const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(bggUrl)}`;
+
+          try {
+            let xmlText = null;
+            const maxRetries = 10;
+            const delay = 3500;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              this.statusMessage = attempt > 1 ? `Polling (${attempt}/${maxRetries})...` : 'Fetching...';
+              
+              // Bust proxy cache using timestamp parameter
+              const reqUrl = `${proxyUrl}&_t=${new Date().getTime()}`;
+              const res = await fetch(reqUrl);
+
+              if (!res.ok) {
+                throw new Error(`HTTP Error ${res.status}: Could not reach BGG proxy.`);
+              }
+
+              const text = await res.text();
+
+              // BGG 202 response includes a standard "Please try again later" message
+              if (text.includes('Please try again later for access') || text.includes('Your request for this collection has been accepted')) {
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+              }
+
+              xmlText = text;
+              break;
+            }
+
+            if (!xmlText) {
+              throw new Error('BGG is still preparing your collection. Please retry in 10-15 seconds.');
+            }
+
+            this.games = this.parseXml(xmlText);
+            if (this.games.length === 0) {
+              this.errorMessage = `No owned games found for user "${user}".`;
+            }
+          } catch (err) {
+            this.errorMessage = err.message || 'An error occurred while communicating with BGG.';
+          } finally {
+            this.loading = false;
+            this.statusMessage = '';
+          }
+        },
+
+        parseXml(xmlString) {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(xmlString, 'application/xml');
+
+          const errors = doc.querySelectorAll('error > message');
+          if (errors.length > 0) {
+            throw new Error(errors[0].textContent || 'BGG returned an error.');
+          }
+
+          const items = doc.querySelectorAll('item');
+          const parsed = [];
+
+          items.forEach(item => {
+            const stats = item.querySelector('stats');
+            const rating = item.querySelector('stats > rating');
+            const average = rating ? rating.querySelector('average') : null;
+            
+            let rankVal = 'N/A';
+            if (rating) {
+              const ranks = rating.querySelectorAll('ranks > rank');
+              ranks.forEach(r => {
+                if (r.getAttribute('name') === 'boardgame' && r.getAttribute('value') !== 'Not Ranked') {
+                  rankVal = r.getAttribute('value');
+                }
+              });
+            }
+
+            parsed.push({
+              id: item.getAttribute('objectid') || '',
+              name: item.querySelector('name')?.textContent || 'Unknown Title',
+              year: parseInt(item.querySelector('yearpublished')?.textContent || '0', 10),
+              thumbnail: item.querySelector('thumbnail')?.textContent || '',
+              min_players: parseInt(stats?.getAttribute('minplayers') || '0', 10),
+              max_players: parseInt(stats?.getAttribute('maxplayers') || '0', 10),
+              playtime: parseInt(stats?.getAttribute('playingtime') || '0', 10),
+              avg_rating: average ? parseFloat(average.getAttribute('value') || '0') : 0.0,
+              bgg_rank: rankVal
+            });
+          });
+
+          return parsed;
+        },
+
+        get filteredGames() {
+          return this.games.filter(g => {
+            const matchesSearch = g.name.toLowerCase().includes(this.searchQuery.toLowerCase());
+            let matchesPlayers = true;
+            if (this.playerFilter) {
+              const req = parseInt(this.playerFilter, 10);
+              matchesPlayers = req >= g.min_players && (req <= g.max_players || g.max_players === 0);
+            }
+            return matchesSearch && matchesPlayers;
+          });
+        },
+
+        exportCSV() {
+          if (this.filteredGames.length === 0) return;
+          const headers = ['id', 'name', 'year', 'min_players', 'max_players', 'playtime', 'avg_rating', 'bgg_rank'];
+          
+          const rows = this.filteredGames.map(g => [
+            g.id,
+            `"${g.name.replace(/"/g, '""')}"`,
+            g.year,
+            g.min_players,
+            g.max_players,
+            g.playtime,
+            g.avg_rating.toFixed(2),
+            `"${g.bgg_rank}"`
+          ]);
+
+          const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+          this.triggerDownload(blob, `${this.username.trim()}_owned_games.csv`);
+        },
+
+        exportJSON() {
+          if (this.filteredGames.length === 0) return;
+          const blob = new Blob([JSON.stringify(this.filteredGames, null, 2)], { type: 'application/json' });
+          this.triggerDownload(blob, `${this.username.trim()}_owned_games.json`);
+        },
+
+        triggerDownload(blob, filename) {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }
+      };
+    }
+  </script>
+</body>
+</html>
