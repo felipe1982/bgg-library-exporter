@@ -14,7 +14,7 @@ async function initiateSearch() {
         return;
     }
 
-    toggleLoading(true, 'Fetching wishlist...');
+    toggleLoading(true, 'Fetching wishlist from BGG...');
     clearResults();
 
     try {
@@ -22,7 +22,7 @@ async function initiateSearch() {
         
         if (wishlist.length === 0) {
             toggleLoading(false);
-            alert('No wishlist items found or user does not exist.');
+            alert('No wishlist items found, user does not exist, or BGG is still processing. Please try again in a moment.');
             return;
         }
 
@@ -31,7 +31,7 @@ async function initiateSearch() {
 
         for (let i = 0; i < total; i++) {
             const game = wishlist[i];
-            updateLoadingText(`Checking market and trades for: ${game.name} (${i + 1}/${total})`);
+            updateLoadingText(`Checking market/trades for: ${game.name} (${i + 1}/${total})`);
             
             const [trades, sales] = await Promise.all([
                 fetchTrades(game.id, country),
@@ -60,9 +60,9 @@ async function initiateSearch() {
                 });
             });
 
-            // Throttling to prevent IP blocks (1.5 seconds)
+            // Throttling to prevent IP blocks (2 seconds)
             if (i < total - 1) {
-                await new Promise(resolve => setTimeout(resolve, 1500));
+                await new Promise(resolve => setTimeout(resolve, 2000));
             }
         }
 
@@ -70,7 +70,7 @@ async function initiateSearch() {
 
     } catch (error) {
         console.error('Error during search:', error);
-        alert('An error occurred. The BGG API might be busy. Please try again later.');
+        alert('An error occurred while connecting to BGG. Their servers may be heavily loaded right now. Please try again shortly.');
     } finally {
         toggleLoading(false);
     }
@@ -81,23 +81,42 @@ async function fetchWishlist(username) {
     const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
     
     let response = await fetch(proxyUrl);
-    
     let retries = 0;
-    while (response.status === 202 && retries < 5) {
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        response = await fetch(proxyUrl);
-        retries++;
+    
+    // BGG returns 202 while it generates the collection on their server
+    while (retries < 6) {
+        if (response.status === 202 || response.status === 503) {
+            retries++;
+            updateLoadingText(`BGG is preparing your collection (Attempt ${retries}/6)...`);
+            await new Promise(resolve => setTimeout(resolve, 4000));
+            response = await fetch(proxyUrl);
+        } else {
+            break;
+        }
+    }
+
+    if (!response.ok) {
+        throw new Error(`Failed to fetch wishlist: ${response.status}`);
     }
 
     const xmlText = await response.text();
-    const json = xmlToJson(xmlText);
     
+    // If the response text is empty or an error message block
+    if (!xmlText || xmlText.includes('<error>')) {
+        return [];
+    }
+
+    const json = xmlToJson(xmlText);
     const items = json.items?.item || [];
     const wishlistArray = Array.isArray(items) ? items : [items];
     
+    if (wishlistArray.length === 0 || !wishlistArray[0]['@_objectid']) {
+        return [];
+    }
+
     return wishlistArray.map(item => ({
         id: item['@_objectid'],
-        name: item.name['#text'] || item.name,
+        name: item.name && item.name['#text'] ? item.name['#text'] : (item.name || 'Unknown Game'),
         thumbnail: item.thumbnail || ''
     }));
 }
@@ -109,8 +128,10 @@ async function fetchTrades(gameId, countryFilter) {
     try {
         const response = await fetch(proxyUrl);
         if (!response.ok) return [];
-        const data = await response.json();
+        const text = await response.text();
+        if (!text.startsWith('{')) return []; // Handle proxy or HTML error pages gracefully
         
+        const data = JSON.parse(text);
         const trades = [];
         if (data.items) {
             data.items.forEach(item => {
@@ -122,7 +143,7 @@ async function fetchTrades(gameId, countryFilter) {
         }
         return trades;
     } catch (e) {
-        console.warn(`Could not fetch trades for ${gameId}`);
+        console.warn(`Could not fetch trades for game ID ${gameId}`);
         return [];
     }
 }
@@ -134,8 +155,10 @@ async function fetchSales(gameId, countryFilter) {
     try {
         const response = await fetch(proxyUrl);
         if (!response.ok) return [];
-        const data = await response.json();
-        
+        const text = await response.text();
+        if (!text.startsWith('{')) return [];
+
+        const data = JSON.parse(text);
         const sales = [];
         if (data.items) {
             data.items.forEach(item => {
@@ -143,7 +166,7 @@ async function fetchSales(gameId, countryFilter) {
                 if (user && user.country && user.country.toLowerCase().includes(countryFilter)) {
                     sales.push({
                         username: user.username,
-                        price: `${item.price.currency} ${item.price.value}`,
+                        price: item.price ? `${item.price.currency} ${item.price.value}` : 'Price N/A',
                         marketId: item.id
                     });
                 }
@@ -151,7 +174,7 @@ async function fetchSales(gameId, countryFilter) {
         }
         return sales;
     } catch (e) {
-        console.warn(`Could not fetch sales for ${gameId}`);
+        console.warn(`Could not fetch sales for game ID ${gameId}`);
         return [];
     }
 }
