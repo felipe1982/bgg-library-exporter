@@ -21,12 +21,18 @@
                 <label for="country">Country/Geography:</label>
                 <input type="text" id="country" placeholder="e.g. Australia" required>
             </div>
+            <div class="input-group checkbox-group">
+                <label for="bypass-cache">
+                    <input type="checkbox" id="bypass-cache"> Bypass local cache
+                </label>
+            </div>
             <button id="search-btn">Search</button>
         </section>
 
         <div id="loading-indicator" class="hidden">
             <div class="spinner"></div>
-            <p id="loading-text">Fetching wishlist...</p>
+            <p id="loading-text">Initialising...</p>
+            <p id="sub-status" class="sub-status-text"></p>
         </div>
 
         <section id="results-section">
@@ -34,6 +40,6 @@
             <div id="results-grid" class="grid"></div>
         </section>
     </main>
-    <script src="app.js"></script>
+    <script src="app.js?v=3"></script>
 </body>
 </html>

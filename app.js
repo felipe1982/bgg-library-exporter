@@ -1,28 +1,37 @@
 // app.js
-const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+const PROXY_LIST = [
+    (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`
+];
+
 const BGG_API_BASE = 'https://boardgamegeek.com/xmlapi2';
 const GEEKDO_API_BASE = 'https://api.geekdo.com/api';
+
+const CACHE_TTL_WISHLIST_MS = 12 * 60 * 60 * 1000; // 12 hours
+const CACHE_TTL_GAME_MS = 2 * 60 * 60 * 1000;      // 2 hours
+const THROTTLE_DELAY_MS = 5000;                    // 5-second polite pacing
 
 document.getElementById('search-btn').addEventListener('click', initiateSearch);
 
 async function initiateSearch() {
     const username = document.getElementById('username').value.trim();
     const country = document.getElementById('country').value.trim().toLowerCase();
+    const bypassCache = document.getElementById('bypass-cache').checked;
     
     if (!username || !country) {
         alert('Please enter both a username and a country.');
         return;
     }
 
-    toggleLoading(true, 'Fetching wishlist from BGG...');
+    toggleLoading(true, 'Fetching wishlist...');
     clearResults();
 
     try {
-        const wishlist = await fetchWishlist(username);
+        const wishlist = await getWishlistWithCache(username, bypassCache);
         
-        if (wishlist.length === 0) {
+        if (!wishlist || wishlist.length === 0) {
             toggleLoading(false);
-            alert('No wishlist items found, user does not exist, or BGG is still processing. Please try again in a moment.');
+            alert('No wishlist items found or user does not exist.');
             return;
         }
 
@@ -31,179 +40,258 @@ async function initiateSearch() {
 
         for (let i = 0; i < total; i++) {
             const game = wishlist[i];
-            updateLoadingText(`Checking market/trades for: ${game.name} (${i + 1}/${total})`);
-            
-            const [trades, sales] = await Promise.all([
-                fetchTrades(game.id, country),
-                fetchSales(game.id, country)
-            ]);
+            updateLoadingText(`Checking market and trades (${i + 1}/${total}): ${game.name}`);
 
-            trades.forEach(trade => {
-                allResults.push({
-                    gameName: game.name,
-                    thumbnail: game.thumbnail,
-                    username: trade.username,
-                    type: 'Trade',
-                    price: null,
-                    link: `https://boardgamegeek.com/user/${trade.username}`
+            try {
+                const gameData = await getGameMarketWithCache(game.id, bypassCache);
+
+                // Filter by country
+                gameData.trades.forEach(trade => {
+                    if (trade.country && trade.country.toLowerCase().includes(country)) {
+                        allResults.push({
+                            gameName: game.name,
+                            thumbnail: game.thumbnail,
+                            username: trade.username,
+                            type: 'Trade',
+                            price: null,
+                            link: `https://boardgamegeek.com/user/${trade.username}`
+                        });
+                    }
                 });
-            });
 
-            sales.forEach(sale => {
-                allResults.push({
-                    gameName: game.name,
-                    thumbnail: game.thumbnail,
-                    username: sale.username,
-                    type: 'Sale',
-                    price: sale.price,
-                    link: `https://boardgamegeek.com/market/product/${sale.marketId}`
+                gameData.sales.forEach(sale => {
+                    if (sale.country && sale.country.toLowerCase().includes(country)) {
+                        allResults.push({
+                            gameName: game.name,
+                            thumbnail: game.thumbnail,
+                            username: sale.username,
+                            type: 'Sale',
+                            price: sale.price,
+                            link: `https://boardgamegeek.com/market/product/${sale.marketId}`
+                        });
+                    }
                 });
-            });
+            } catch (err) {
+                console.warn(`Skipping game ${game.name} due to fetch error:`, err);
+            }
 
-            // Throttling to prevent IP blocks (2 seconds)
+            // Apply throttling delay only if more items remain and item was not from cache
             if (i < total - 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await countdownPause(THROTTLE_DELAY_MS);
             }
         }
 
         displayResults(allResults);
 
     } catch (error) {
-        console.error('Error during search:', error);
-        alert('An error occurred while connecting to BGG. Their servers may be heavily loaded right now. Please try again shortly.');
+        console.error('Fatal search error:', error);
+        alert(`Search could not be completed: ${error.message}`);
     } finally {
         toggleLoading(false);
     }
 }
 
-async function fetchWishlist(username) {
-    const url = `${BGG_API_BASE}/collection?username=${username}&wishlist=1`;
-    const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-    
-    let response = await fetch(proxyUrl);
-    let retries = 0;
-    
-    // BGG returns 202 while it generates the collection on their server
-    while (retries < 6) {
-        if (response.status === 202 || response.status === 503) {
-            retries++;
-            updateLoadingText(`BGG is preparing your collection (Attempt ${retries}/6)...`);
-            await new Promise(resolve => setTimeout(resolve, 4000));
-            response = await fetch(proxyUrl);
-        } else {
-            break;
+// Fetch with automatic proxy failover and exponential backoff
+async function fetchWithBackoff(targetUrl, maxRetries = 4, baseDelay = 3000) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        // Alternate proxies across attempts if retrying
+        const proxySelector = PROXY_LIST[attempt % PROXY_LIST.length];
+        const requestUrl = proxySelector(targetUrl);
+
+        try {
+            const response = await fetch(requestUrl);
+
+            // BGG 202 (queued) or rate limit responses (429/503)
+            if (response.status === 202 || response.status === 429 || response.status === 503) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                updateSubStatus(`BGG is preparing data (Status ${response.status}). Retrying in ${delay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
+            const text = await response.text();
+            
+            // Check for BGG error responses inside 200 bodies
+            if (text.includes('<message>Your request for this collection has been accepted and will be processed')) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                updateSubStatus(`Collection request queued by BGG. Retrying in ${delay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            updateSubStatus('');
+            return text;
+
+        } catch (err) {
+            lastError = err;
+            const delay = baseDelay * Math.pow(2, attempt);
+            updateSubStatus(`Connection issue. Retrying with alternate route in ${delay / 1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
 
-    if (!response.ok) {
-        throw new Error(`Failed to fetch wishlist: ${response.status}`);
+    updateSubStatus('');
+    throw lastError || new Error('Request failed after maximum backoff retries.');
+}
+
+// Wishlist handling with localStorage caching
+async function getWishlistWithCache(username, bypassCache) {
+    const cacheKey = `bgg_wishlist_${username.toLowerCase()}`;
+
+    if (!bypassCache) {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+            try {
+                const parsed = JSON.parse(cached);
+                if (Date.now() - parsed.timestamp < CACHE_TTL_WISHLIST_MS) {
+                    updateSubStatus('Loaded wishlist from local cache.');
+                    return parsed.data;
+                }
+            } catch (e) {
+                localStorage.removeItem(cacheKey);
+            }
+        }
     }
 
-    const xmlText = await response.text();
-    
-    // If the response text is empty or an error message block
-    if (!xmlText || xmlText.includes('<error>')) {
-        return [];
-    }
-
+    const url = `${BGG_API_BASE}/collection?username=${encodeURIComponent(username)}&wishlist=1`;
+    const xmlText = await fetchWithBackoff(url);
     const json = xmlToJson(xmlText);
+    
     const items = json.items?.item || [];
     const wishlistArray = Array.isArray(items) ? items : [items];
     
-    if (wishlistArray.length === 0 || !wishlistArray[0]['@_objectid']) {
-        return [];
-    }
+    const cleanList = wishlistArray
+        .filter(item => item && item['@_objectid'])
+        .map(item => ({
+            id: item['@_objectid'],
+            name: item.name && item.name['#text'] ? item.name['#text'] : (item.name || 'Unknown Title'),
+            thumbnail: item.thumbnail || ''
+        }));
 
-    return wishlistArray.map(item => ({
-        id: item['@_objectid'],
-        name: item.name && item.name['#text'] ? item.name['#text'] : (item.name || 'Unknown Game'),
-        thumbnail: item.thumbnail || ''
+    localStorage.setItem(cacheKey, JSON.stringify({
+        timestamp: Date.now(),
+        data: cleanList
     }));
+
+    return cleanList;
 }
 
-async function fetchTrades(gameId, countryFilter) {
-    const url = `${GEEKDO_API_BASE}/collections?objectid=${gameId}&objecttype=thing&fortrade=1`;
-    const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-    
+// Market and trade data handling with localStorage caching
+async function getGameMarketWithCache(gameId, bypassCache) {
+    const cacheKey = `bgg_market_${gameId}`;
+
+    if (!bypassCache) {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+            try {
+                const parsed = JSON.parse(cached);
+                if (Date.now() - parsed.timestamp < CACHE_TTL_GAME_MS) {
+                    return parsed.data;
+                }
+            } catch (e) {
+                localStorage.removeItem(cacheKey);
+            }
+        }
+    }
+
+    const tradeUrl = `${GEEKDO_API_BASE}/collections?objectid=${gameId}&objecttype=thing&fortrade=1`;
+    const saleUrl = `${GEEKDO_API_BASE}/market/products?objectid=${gameId}&objecttype=thing&stock=instock`;
+
+    const trades = [];
+    const sales = [];
+
     try {
-        const response = await fetch(proxyUrl);
-        if (!response.ok) return [];
-        const text = await response.text();
-        if (!text.startsWith('{')) return []; // Handle proxy or HTML error pages gracefully
-        
-        const data = JSON.parse(text);
-        const trades = [];
-        if (data.items) {
-            data.items.forEach(item => {
-                const user = item.user;
-                if (user && user.country && user.country.toLowerCase().includes(countryFilter)) {
-                    trades.push({ username: user.username });
+        const tradeText = await fetchWithBackoff(tradeUrl, 2, 2000);
+        if (tradeText.startsWith('{')) {
+            const parsedTrade = JSON.parse(tradeText);
+            (parsedTrade.items || []).forEach(item => {
+                if (item.user) {
+                    trades.push({
+                        username: item.user.username,
+                        country: item.user.country || ''
+                    });
                 }
             });
         }
-        return trades;
     } catch (e) {
-        console.warn(`Could not fetch trades for game ID ${gameId}`);
-        return [];
+        console.warn(`Could not load trades for game ${gameId}`);
     }
-}
 
-async function fetchSales(gameId, countryFilter) {
-    const url = `${GEEKDO_API_BASE}/market/products?objectid=${gameId}&objecttype=thing&stock=instock`;
-    const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-    
     try {
-        const response = await fetch(proxyUrl);
-        if (!response.ok) return [];
-        const text = await response.text();
-        if (!text.startsWith('{')) return [];
-
-        const data = JSON.parse(text);
-        const sales = [];
-        if (data.items) {
-            data.items.forEach(item => {
-                const user = item.user;
-                if (user && user.country && user.country.toLowerCase().includes(countryFilter)) {
+        const saleText = await fetchWithBackoff(saleUrl, 2, 2000);
+        if (saleText.startsWith('{')) {
+            const parsedSale = JSON.parse(saleText);
+            (parsedSale.items || []).forEach(item => {
+                if (item.user) {
                     sales.push({
-                        username: user.username,
-                        price: item.price ? `${item.price.currency} ${item.price.value}` : 'Price N/A',
+                        username: item.user.username,
+                        country: item.user.country || '',
+                        price: item.price ? `${item.price.currency} ${item.price.value}` : 'Listed',
                         marketId: item.id
                     });
                 }
             });
         }
-        return sales;
     } catch (e) {
-        console.warn(`Could not fetch sales for game ID ${gameId}`);
-        return [];
+        console.warn(`Could not load sales for game ${gameId}`);
     }
+
+    const result = { trades, sales };
+
+    localStorage.setItem(cacheKey, JSON.stringify({
+        timestamp: Date.now(),
+        data: result
+    }));
+
+    return result;
+}
+
+function countdownPause(durationMs) {
+    return new Promise(resolve => {
+        let remaining = durationMs / 1000;
+        updateSubStatus(`Polite rate pacing: waiting ${remaining}s before next request...`);
+        
+        const interval = setInterval(() => {
+            remaining--;
+            if (remaining <= 0) {
+                clearInterval(interval);
+                updateSubStatus('');
+                resolve();
+            } else {
+                updateSubStatus(`Polite rate pacing: waiting ${remaining}s before next request...`);
+            }
+        }, 1000);
+    });
 }
 
 function xmlToJson(xmlString) {
     const parser = new DOMParser();
-    const xml = parser.parseFromString(xmlString, "text/xml");
+    const xml = parser.parseFromString(xmlString, 'text/xml');
     
     function parseNode(node) {
         const obj = {};
-        if (node.nodeType === 1) { 
-            if (node.attributes.length > 0) {
-                for (let j = 0; j < node.attributes.length; j++) {
-                    const attribute = node.attributes.item(j);
-                    obj[`@_${attribute.nodeName}`] = attribute.nodeValue;
-                }
+        if (node.nodeType === 1 && node.attributes.length > 0) {
+            for (let j = 0; j < node.attributes.length; j++) {
+                const attribute = node.attributes.item(j);
+                obj[`@_${attribute.nodeName}`] = attribute.nodeValue;
             }
-        } else if (node.nodeType === 3) { 
+        } else if (node.nodeType === 3) {
             return node.nodeValue.trim();
         }
+
         if (node.hasChildNodes()) {
             for (let i = 0; i < node.childNodes.length; i++) {
                 const item = node.childNodes.item(i);
                 const nodeName = item.nodeName;
                 if (nodeName === '#text') {
                     const text = item.nodeValue.trim();
-                    if (text) {
-                        obj['#text'] = text;
-                    }
+                    if (text) obj['#text'] = text;
                 } else {
                     const childObj = parseNode(item);
                     if (obj[nodeName] === undefined) {
@@ -217,6 +305,7 @@ function xmlToJson(xmlString) {
                 }
             }
         }
+
         if (Object.keys(obj).length === 1 && obj['#text']) {
             return obj['#text'];
         }
@@ -248,7 +337,7 @@ function displayResults(results) {
                 <h3 class="card-title">${res.gameName}</h3>
                 <p class="card-detail"><strong>User:</strong> ${res.username}</p>
                 ${priceHtml}
-                <a href="${res.link}" target="_blank" class="card-link">View ${res.type === 'Sale' ? 'Listing' : 'Profile'}</a>
+                <a href="${res.link}" target="_blank" rel="noopener noreferrer" class="card-link">View ${res.type === 'Sale' ? 'Listing' : 'Profile'}</a>
             </div>
         `;
         grid.appendChild(card);
@@ -258,9 +347,11 @@ function displayResults(results) {
 function toggleLoading(show, text = '') {
     const indicator = document.getElementById('loading-indicator');
     const textEl = document.getElementById('loading-text');
+    const subStatusEl = document.getElementById('sub-status');
     if (show) {
         indicator.classList.remove('hidden');
         textEl.textContent = text;
+        subStatusEl.textContent = '';
     } else {
         indicator.classList.add('hidden');
     }
@@ -268,6 +359,10 @@ function toggleLoading(show, text = '') {
 
 function updateLoadingText(text) {
     document.getElementById('loading-text').textContent = text;
+}
+
+function updateSubStatus(text) {
+    document.getElementById('sub-status').textContent = text;
 }
 
 function clearResults() {
