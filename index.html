@@ -1,3 +1,4 @@
+```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -241,13 +242,16 @@
     </main>
 
     <footer>
-        <p>App Version: September 26, 2026, 7:43 PM AEST</p>
+        <p>App Version: September 26, 2026, 7:50:00 PM AEST</p>
     </footer>
 
     <script>
+        // Smarter proxy list: Try direct first, then cascade through reliable proxies
         const PROXY_LIST = [
-            (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-            (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`
+            (url) => url, // 1. Attempt direct connection (Fastest, works if BGG allows CORS)
+            (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, // 2. Codetabs (Very reliable)
+            (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, // 3. AllOrigins
+            (url) => `https://corsproxy.io/?${encodeURIComponent(url)}` // 4. CorsProxy (Backup)
         ];
 
         const BGG_API_BASE = 'https://boardgamegeek.com/xmlapi2';
@@ -337,22 +341,25 @@
             }
         }
 
-        // Fetch with automatic proxy failover and exponential backoff
-        async function fetchWithBackoff(targetUrl, maxRetries = 4, baseDelay = 3000) {
+        // Fetch with intelligent proxy failover and exponential backoff
+        async function fetchWithBackoff(targetUrl, maxRetries = 6, baseDelay = 2500) {
             let lastError = null;
 
             for (let attempt = 0; attempt < maxRetries; attempt++) {
-                // Alternate proxies across attempts if retrying
                 const proxySelector = PROXY_LIST[attempt % PROXY_LIST.length];
                 const requestUrl = proxySelector(targetUrl);
+                const isDirect = (requestUrl === targetUrl);
 
                 try {
-                    const response = await fetch(requestUrl);
+                    let routeName = isDirect ? 'Direct' : `Proxy ${attempt % PROXY_LIST.length}`;
+                    updateSubStatus(`Connecting... (Attempt ${attempt + 1}/${maxRetries} via ${routeName})`);
+                    
+                    const response = await fetch(requestUrl, { cache: 'no-store' });
 
                     // BGG 202 (queued) or rate limit responses (429/503)
                     if (response.status === 202 || response.status === 429 || response.status === 503) {
-                        const delay = baseDelay * Math.pow(2, attempt);
-                        updateSubStatus(`BGG is preparing data (Status ${response.status}). Retrying in ${delay / 1000}s...`);
+                        const delay = baseDelay * Math.pow(1.5, attempt);
+                        updateSubStatus(`BGG is busy (Status ${response.status}). Waiting ${Math.round(delay / 1000)}s...`);
                         await new Promise(resolve => setTimeout(resolve, delay));
                         continue;
                     }
@@ -365,8 +372,8 @@
                     
                     // Check for BGG error responses inside 200 bodies
                     if (text.includes('<message>Your request for this collection has been accepted and will be processed')) {
-                        const delay = baseDelay * Math.pow(2, attempt);
-                        updateSubStatus(`Collection request queued by BGG. Retrying in ${delay / 1000}s...`);
+                        const delay = baseDelay * Math.pow(1.5, attempt);
+                        updateSubStatus(`BGG is generating your collection. Waiting ${Math.round(delay / 1000)}s...`);
                         await new Promise(resolve => setTimeout(resolve, delay));
                         continue;
                     }
@@ -376,8 +383,15 @@
 
                 } catch (err) {
                     lastError = err;
-                    const delay = baseDelay * Math.pow(2, attempt);
-                    updateSubStatus(`Connection issue. Retrying with alternate route in ${delay / 1000}s...`);
+                    
+                    // If it's a TypeError on a Direct connection, it's almost certainly a CORS block. 
+                    // Jump to the proxy immediately instead of waiting a long time.
+                    const isLikelyCORS = (isDirect && err.name === 'TypeError');
+                    const delay = isLikelyCORS ? 500 : (baseDelay * Math.pow(1.5, attempt));
+                    
+                    if (!isLikelyCORS) {
+                        updateSubStatus(`Connection failed. Retrying alternate route in ${Math.round(delay / 1000)}s...`);
+                    }
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
@@ -453,7 +467,7 @@
             const sales = [];
 
             try {
-                const tradeText = await fetchWithBackoff(tradeUrl, 2, 2000);
+                const tradeText = await fetchWithBackoff(tradeUrl, 5, 1500);
                 if (tradeText.startsWith('{')) {
                     const parsedTrade = JSON.parse(tradeText);
                     (parsedTrade.items || []).forEach(item => {
@@ -470,7 +484,7 @@
             }
 
             try {
-                const saleText = await fetchWithBackoff(saleUrl, 2, 2000);
+                const saleText = await fetchWithBackoff(saleUrl, 5, 1500);
                 if (saleText.startsWith('{')) {
                     const parsedSale = JSON.parse(saleText);
                     (parsedSale.items || []).forEach(item => {
@@ -617,3 +631,4 @@
     </script>
 </body>
 </html>
+```
