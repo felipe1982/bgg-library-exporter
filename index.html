@@ -1,4 +1,3 @@
-```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -242,16 +241,16 @@
     </main>
 
     <footer>
-        <p>App Version: September 26, 2026, 7:50:00 PM AEST</p>
+        <p>App Version: September 26, 2026, 7:56:42 PM AEST</p>
     </footer>
 
     <script>
-        // Smarter proxy list: Try direct first, then cascade through reliable proxies
+        // Use a robust list of active CORS proxies. We removed the "direct" attempt
+        // as BGG's strict CORS headers will almost always block it from GitHub Pages.
         const PROXY_LIST = [
-            (url) => url, // 1. Attempt direct connection (Fastest, works if BGG allows CORS)
-            (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, // 2. Codetabs (Very reliable)
-            (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, // 3. AllOrigins
-            (url) => `https://corsproxy.io/?${encodeURIComponent(url)}` // 4. CorsProxy (Backup)
+            (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+            (url) => `https://corsfix.com/api?url=${encodeURIComponent(url)}`, // Newer proxy service
+            (url) => `https://api.cors.lol/?url=${encodeURIComponent(url)}`     // Backup proxy
         ];
 
         const BGG_API_BASE = 'https://boardgamegeek.com/xmlapi2';
@@ -335,24 +334,29 @@
 
             } catch (error) {
                 console.error('Fatal search error:', error);
-                alert(`Search could not be completed: ${error.message}`);
+                // Improved error message to explain proxy exhaustion
+                if (error.message.includes('maximum proxy retries')) {
+                    alert('Network Error: Unable to connect to BGG. The public routing proxies may be temporarily blocked or overloaded. Please try again later.');
+                } else {
+                    alert(`Search could not be completed: ${error.message}`);
+                }
             } finally {
                 toggleLoading(false);
             }
         }
 
-        // Fetch with intelligent proxy failover and exponential backoff
-        async function fetchWithBackoff(targetUrl, maxRetries = 6, baseDelay = 2500) {
+        async function fetchWithBackoff(targetUrl, maxRetries = 5, baseDelay = 3000) {
             let lastError = null;
 
+            // We iterate through our max retries, cycling through the proxy list
             for (let attempt = 0; attempt < maxRetries; attempt++) {
                 const proxySelector = PROXY_LIST[attempt % PROXY_LIST.length];
                 const requestUrl = proxySelector(targetUrl);
-                const isDirect = (requestUrl === targetUrl);
+                
+                const proxyDomain = new URL(requestUrl).hostname;
 
                 try {
-                    let routeName = isDirect ? 'Direct' : `Proxy ${attempt % PROXY_LIST.length}`;
-                    updateSubStatus(`Connecting... (Attempt ${attempt + 1}/${maxRetries} via ${routeName})`);
+                    updateSubStatus(`Connecting via ${proxyDomain}... (Attempt ${attempt + 1}/${maxRetries})`);
                     
                     const response = await fetch(requestUrl, { cache: 'no-store' });
 
@@ -361,11 +365,11 @@
                         const delay = baseDelay * Math.pow(1.5, attempt);
                         updateSubStatus(`BGG is busy (Status ${response.status}). Waiting ${Math.round(delay / 1000)}s...`);
                         await new Promise(resolve => setTimeout(resolve, delay));
-                        continue;
+                        continue; // Retry the same request if BGG just needs time
                     }
 
                     if (!response.ok) {
-                        throw new Error(`HTTP error ${response.status}`);
+                        throw new Error(`HTTP error ${response.status} from ${proxyDomain}`);
                     }
 
                     const text = await response.text();
@@ -384,23 +388,19 @@
                 } catch (err) {
                     lastError = err;
                     
-                    // If it's a TypeError on a Direct connection, it's almost certainly a CORS block. 
-                    // Jump to the proxy immediately instead of waiting a long time.
-                    const isLikelyCORS = (isDirect && err.name === 'TypeError');
-                    const delay = isLikelyCORS ? 500 : (baseDelay * Math.pow(1.5, attempt));
+                    // If we failed to fetch, it's likely a proxy block or CORS issue.
+                    // We immediately move to the next proxy with a very short delay.
+                    const delay = 1000;
                     
-                    if (!isLikelyCORS) {
-                        updateSubStatus(`Connection failed. Retrying alternate route in ${Math.round(delay / 1000)}s...`);
-                    }
+                    updateSubStatus(`Connection failed via ${proxyDomain}. Trying next route...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
 
             updateSubStatus('');
-            throw lastError || new Error('Request failed after maximum backoff retries.');
+            throw new Error(`Failed after maximum proxy retries. Last error: ${lastError.message}`);
         }
 
-        // Wishlist handling with localStorage caching
         async function getWishlistWithCache(username, bypassCache) {
             const cacheKey = `bgg_wishlist_${username.toLowerCase()}`;
 
@@ -442,7 +442,6 @@
             return cleanList;
         }
 
-        // Market and trade data handling with localStorage caching
         async function getGameMarketWithCache(gameId, bypassCache) {
             const cacheKey = `bgg_market_${gameId}`;
 
@@ -467,7 +466,8 @@
             const sales = [];
 
             try {
-                const tradeText = await fetchWithBackoff(tradeUrl, 5, 1500);
+                // Reduced retries for specific market items to speed up overall processing
+                const tradeText = await fetchWithBackoff(tradeUrl, 3, 2000);
                 if (tradeText.startsWith('{')) {
                     const parsedTrade = JSON.parse(tradeText);
                     (parsedTrade.items || []).forEach(item => {
@@ -484,7 +484,7 @@
             }
 
             try {
-                const saleText = await fetchWithBackoff(saleUrl, 5, 1500);
+                const saleText = await fetchWithBackoff(saleUrl, 3, 2000);
                 if (saleText.startsWith('{')) {
                     const parsedSale = JSON.parse(saleText);
                     (parsedSale.items || []).forEach(item => {
@@ -631,4 +631,3 @@
     </script>
 </body>
 </html>
-```
